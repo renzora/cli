@@ -13,7 +13,7 @@ use std::process::{Command, ExitStatus};
 
 use clap::{Parser, Subcommand};
 
-const IMAGE: &str = "renzora/engine";
+const IMAGE: &str = "ghcr.io/renzora/engine";
 const DOCKERFILE: &str = "docker/engine-builder/Dockerfile";
 const ENGINE_REPO: &str = "https://github.com/renzora/engine";
 // Vendored-crate excludes — mirror .github/workflows/test.yml so local and CI agree.
@@ -197,14 +197,14 @@ fn container_name(root: &Path) -> String {
 /// `renzora destroy && renzora init` to recreate the container against it.
 fn ensure_up(root: &Path, name: &str) {
     if docker_out(&["images", "-q", IMAGE]).trim().is_empty() {
-        eprintln!("Building image {IMAGE} (first time, this takes a while)...");
-        let st = Command::new("docker")
-            .current_dir(root)
-            .args(["build", "-f", DOCKERFILE, "-t", IMAGE, "."])
-            .status()
-            .unwrap_or_else(|e| fail(format!("docker build failed to start (is Docker installed/running?): {e}")));
-        if !st.success() {
-            std::process::exit(st.code().unwrap_or(1));
+        // Prefer the prebuilt toolchain image from the registry: a ~3 GB pull
+        // takes a few minutes, versus 10-25 min to build osxcross/NDK/xwin/etc.
+        // from scratch. Fall back to building it locally if the pull fails
+        // (offline, or an engine dev who has edited the Dockerfile).
+        eprintln!("Fetching toolchain image {IMAGE} (first time)...");
+        if !pull_image() {
+            eprintln!("Could not pull {IMAGE} — building it locally instead (this takes a while)...");
+            build_image(root);
         }
     }
     let by_name = format!("name=^{name}$");
@@ -223,6 +223,29 @@ fn ensure_up(root: &Path, name: &str) {
         }
     }
     docker(&["start", name]);
+}
+
+/// `docker pull IMAGE`; returns true on success. Failures are quiet so the
+/// caller can fall back to building locally.
+fn pull_image() -> bool {
+    Command::new("docker")
+        .args(["pull", IMAGE])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Build the toolchain image from the Dockerfile (the offline / Dockerfile-edit
+/// fallback when the registry pull isn't available).
+fn build_image(root: &Path) {
+    let st = Command::new("docker")
+        .current_dir(root)
+        .args(["build", "-f", DOCKERFILE, "-t", IMAGE, "."])
+        .status()
+        .unwrap_or_else(|e| fail(format!("docker build failed to start (is Docker installed/running?): {e}")));
+    if !st.success() {
+        std::process::exit(st.code().unwrap_or(1));
+    }
 }
 
 /// Cross-build for the host, then run the produced binary natively (GPU stays
