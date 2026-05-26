@@ -1,0 +1,296 @@
+//! `renzora` — the Renzora engine CLI.
+//!
+//! Scaffolds projects (`renzora new`) and drives the pinned `renzora/engine`
+//! container for everything else, so builds/tests run in one controlled
+//! toolchain (the ABI contract the dlopen plugin system depends on). Install
+//! with `cargo install renzora`; it finds the engine checkout by walking up
+//! from the current directory.
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
+
+use clap::{Parser, Subcommand};
+
+const IMAGE: &str = "renzora/engine";
+const DOCKERFILE: &str = "docker/engine-builder/Dockerfile";
+const ENGINE_REPO: &str = "https://github.com/renzora/engine";
+// Vendored-crate excludes — mirror .github/workflows/test.yml so local and CI agree.
+const EXCLUDES: &[&str] = &[
+    "--exclude", "renzora_shader",
+    "--exclude", "bevy_gauge",
+    "--exclude", "bevy_hanabi",
+    "--exclude", "bevy_mod_outline",
+    "--exclude", "bevy_silk",
+    "--exclude", "vleue_navigator",
+    "--exclude", "bevy_mod_openxr",
+    "--exclude", "bevy_mod_xr",
+    "--exclude", "bevy_xr_utils",
+];
+
+#[derive(Parser)]
+#[command(name = "renzora", about = "Renzora engine CLI — scaffold projects and run everything in the pinned container.", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Create a new project by cloning the engine from GitHub.
+    New {
+        /// Directory to create.
+        name: String,
+    },
+    /// Build the image + create/start the container (idempotent).
+    Init,
+    /// Cross-build for one or more platforms (no args = all).
+    Build { platforms: Vec<String> },
+    /// Run the test suite in the container (no args = workspace suite).
+    Test {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// `cargo check` in the container.
+    Check {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Build for this host, then run it (editor default).
+    Run { target: Option<String> },
+    /// Scaffold a new plugin crate.
+    Add {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Delete a plugin crate.
+    Remove { args: Vec<String> },
+    /// UPX-compress built binaries under dist/.
+    Upx { args: Vec<String> },
+    /// Interactive shell in the container.
+    Shell,
+    /// Remove target/ in the container.
+    Clean,
+    /// Remove the container.
+    Destroy,
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    // `new` runs from anywhere — there's no engine checkout yet.
+    if let Commands::New { name } = &cli.command {
+        new_project(name);
+        return;
+    }
+
+    // Everything else operates on an existing engine checkout.
+    let root = find_repo_root();
+    let name = container_name(&root);
+
+    match cli.command {
+        Commands::New { .. } => unreachable!("handled above"),
+        Commands::Init => {
+            ensure_up(&root, &name);
+            println!("Container {name} is running.");
+        }
+        Commands::Build { platforms } => {
+            ensure_up(&root, &name);
+            dexec(&name, &format!("/app/src/docker/scripts/build-all.sh dist {}", platforms.join(" ")));
+        }
+        Commands::Test { args } => {
+            ensure_up(&root, &name);
+            if args.is_empty() {
+                dexec(&name, &format!("cargo test --workspace {}", EXCLUDES.join(" ")));
+            } else {
+                dexec(&name, &format!("cargo test {}", args.join(" ")));
+            }
+        }
+        Commands::Check { args } => {
+            ensure_up(&root, &name);
+            if args.is_empty() {
+                dexec(&name, &format!("cargo check --workspace {}", EXCLUDES.join(" ")));
+            } else {
+                dexec(&name, &format!("cargo check {}", args.join(" ")));
+            }
+        }
+        Commands::Run { target } => run(&root, &name, target),
+        Commands::Add { args } => {
+            ensure_up(&root, &name);
+            dexec(&name, &format!("bash docker/scripts/add-plugin.sh {}", args.join(" ")));
+        }
+        Commands::Remove { args } => {
+            ensure_up(&root, &name);
+            dexec(&name, &format!("bash docker/scripts/remove-plugin.sh {}", args.join(" ")));
+        }
+        Commands::Upx { args } => {
+            ensure_up(&root, &name);
+            dexec(&name, &format!("bash docker/scripts/upx-compress.sh {}", args.join(" ")));
+        }
+        Commands::Shell => {
+            ensure_up(&root, &name);
+            let st = Command::new("docker")
+                .args(["exec", "-it", &name, "bash"])
+                .status()
+                .unwrap_or_else(|e| fail(format!("docker exec failed: {e}")));
+            std::process::exit(st.code().unwrap_or(0));
+        }
+        Commands::Clean => {
+            ensure_up(&root, &name);
+            dexec(&name, "rm -rf target && echo 'target/ cleaned'");
+        }
+        Commands::Destroy => {
+            docker(&["rm", "-f", &name]);
+            println!("Removed container {name}.");
+        }
+    }
+}
+
+/// `renzora new <name>` — shallow-clone the engine into a new directory.
+fn new_project(name: &str) {
+    if Path::new(name).exists() {
+        fail(format!("`{name}` already exists"));
+    }
+    println!("Cloning {ENGINE_REPO} into {name} ...");
+    let st = Command::new("git")
+        .args(["clone", "--depth", "1", ENGINE_REPO, name])
+        .status()
+        .unwrap_or_else(|e| fail(format!("git clone failed (is git installed?): {e}")));
+    if !st.success() {
+        std::process::exit(st.code().unwrap_or(1));
+    }
+    println!("\nDone. Next:");
+    println!("  cd {name}");
+    println!("  renzora init     # build the toolchain image + container (first run is slow)");
+    println!("  renzora run      # build the editor and launch it");
+}
+
+/// Walk up from the current dir to the engine repo root (the dir holding the
+/// builder Dockerfile).
+fn find_repo_root() -> PathBuf {
+    let mut dir = std::env::current_dir().unwrap_or_else(|e| fail(format!("cannot read cwd: {e}")));
+    loop {
+        if dir.join(DOCKERFILE).exists() {
+            return dir;
+        }
+        match dir.parent() {
+            Some(p) => dir = p.to_path_buf(),
+            None => fail(format!(
+                "not inside a Renzora engine checkout (no {DOCKERFILE} found). Run `renzora new <name>` first."
+            )),
+        }
+    }
+}
+
+/// Per-checkout container name, derived from the repo path (stable per clone).
+fn container_name(root: &Path) -> String {
+    let mut h = DefaultHasher::new();
+    root.to_string_lossy().hash(&mut h);
+    format!("renzora-{:08x}", h.finish() as u32)
+}
+
+/// Build the image if missing, create the container if missing, start it.
+///
+/// Reuses an existing container across commands (no per-invocation recreate).
+/// After rebuilding the image (e.g. editing the Dockerfile), run
+/// `renzora destroy && renzora init` to recreate the container against it.
+fn ensure_up(root: &Path, name: &str) {
+    if docker_out(&["images", "-q", IMAGE]).trim().is_empty() {
+        eprintln!("Building image {IMAGE} (first time, this takes a while)...");
+        let st = Command::new("docker")
+            .current_dir(root)
+            .args(["build", "-f", DOCKERFILE, "-t", IMAGE, "."])
+            .status()
+            .unwrap_or_else(|e| fail(format!("docker build failed to start (is Docker installed/running?): {e}")));
+        if !st.success() {
+            std::process::exit(st.code().unwrap_or(1));
+        }
+    }
+    let by_name = format!("name=^{name}$");
+    if docker_out(&["ps", "-aq", "-f", &by_name]).trim().is_empty() {
+        eprintln!("Creating container {name}...");
+        let mount = format!("{}:/app/src", root.display());
+        let st = Command::new("docker")
+            .args([
+                "create", "--name", name, "-v", &mount, "-w", "/app/src", IMAGE, "sleep",
+                "infinity",
+            ])
+            .status()
+            .unwrap_or_else(|e| fail(format!("docker create failed: {e}")));
+        if !st.success() {
+            std::process::exit(st.code().unwrap_or(1));
+        }
+    }
+    docker(&["start", name]);
+}
+
+/// Cross-build for the host, then run the produced binary natively (GPU stays
+/// on the host; the container can't display).
+fn run(root: &Path, name: &str, target: Option<String>) {
+    ensure_up(root, name);
+    let feature = target.unwrap_or_else(|| "editor".into());
+    if feature != "editor" && feature != "runtime" {
+        fail("usage: renzora run [editor|runtime]".into());
+    }
+    let (platform, outdir, ext) = host_platform();
+    dexec(name, &format!("/app/src/docker/scripts/build-all.sh dist {platform}"));
+
+    let bin = if feature == "runtime" { "renzora-runtime" } else { "renzora" };
+    let dir = root.join("dist").join(outdir).join(&feature);
+    let path = dir.join(format!("{bin}{ext}"));
+    if !path.exists() {
+        fail(format!("built binary not found: {}", path.display()));
+    }
+    println!("Running {} ...", path.display());
+    let st = Command::new(&path)
+        .current_dir(&dir)
+        .status()
+        .unwrap_or_else(|e| fail(format!("failed to launch {}: {e}", path.display())));
+    std::process::exit(st.code().unwrap_or(0));
+}
+
+/// (platform arg for build-all.sh, dist output dir, executable extension).
+fn host_platform() -> (&'static str, &'static str, &'static str) {
+    if cfg!(target_os = "windows") {
+        ("windows", "windows-x64", ".exe")
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            ("macos", "macos-arm64", "")
+        } else {
+            ("macos", "macos-x64", "")
+        }
+    } else {
+        ("linux", "linux-x64", "")
+    }
+}
+
+fn dexec(name: &str, cmd: &str) {
+    let st = Command::new("docker")
+        .args(["exec", name, "bash", "-c", cmd])
+        .status()
+        .unwrap_or_else(|e| fail(format!("docker exec failed: {e}")));
+    if !st.success() {
+        std::process::exit(st.code().unwrap_or(1));
+    }
+}
+
+fn docker(args: &[&str]) -> ExitStatus {
+    Command::new("docker")
+        .args(args)
+        .status()
+        .unwrap_or_else(|e| fail(format!("failed to run docker (is it installed/running?): {e}")))
+}
+
+fn docker_out(args: &[&str]) -> String {
+    Command::new("docker")
+        .args(args)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+fn fail(msg: String) -> ! {
+    eprintln!("renzora: {msg}");
+    std::process::exit(1);
+}
