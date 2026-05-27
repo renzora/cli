@@ -14,7 +14,7 @@ use std::process::{Command, ExitStatus};
 use clap::{Parser, Subcommand};
 
 const IMAGE: &str = "ghcr.io/renzora/engine";
-const DOCKERFILE: &str = "docker/engine-builder/Dockerfile";
+const DOCKERFILE: &str = "docker/Dockerfile";
 const ENGINE_REPO: &str = "https://github.com/renzora/engine";
 // Vendored-crate excludes — mirror .github/workflows/test.yml so local and CI agree.
 const EXCLUDES: &[&str] = &[
@@ -99,7 +99,7 @@ fn main() {
         }
         Commands::Build { platforms } => {
             ensure_up(&root, &name);
-            dexec(&name, &format!("/app/src/docker/scripts/build-all.sh dist {}", platforms.join(" ")));
+            dexec(&name, &format!("/app/src/docker/build-all.sh dist {}", platforms.join(" ")));
         }
         Commands::Test { args } => {
             ensure_up(&root, &name);
@@ -120,15 +120,15 @@ fn main() {
         Commands::Run { target } => run(&root, &name, target),
         Commands::Add { args } => {
             ensure_up(&root, &name);
-            dexec(&name, &format!("bash docker/scripts/add-plugin.sh {}", args.join(" ")));
+            dexec(&name, &format!("bash docker/add-plugin.sh {}", args.join(" ")));
         }
         Commands::Remove { args } => {
             ensure_up(&root, &name);
-            dexec(&name, &format!("bash docker/scripts/remove-plugin.sh {}", args.join(" ")));
+            dexec(&name, &format!("bash docker/remove-plugin.sh {}", args.join(" ")));
         }
         Commands::Upx { args } => {
             ensure_up(&root, &name);
-            dexec(&name, &format!("bash docker/scripts/upx-compress.sh {}", args.join(" ")));
+            dexec(&name, &format!("bash docker/upx-compress.sh {}", args.join(" ")));
         }
         Commands::Shell => {
             ensure_up(&root, &name);
@@ -316,7 +316,7 @@ fn run(root: &Path, name: &str, target: Option<String>) {
         fail("usage: renzora run [editor|runtime]".into());
     }
     let (platform, outdir, ext) = host_platform();
-    dexec(name, &format!("/app/src/docker/scripts/build-all.sh dist {platform}"));
+    dexec(name, &format!("/app/src/docker/build-all.sh dist {platform}"));
 
     let bin = if feature == "runtime" { "renzora-runtime" } else { "renzora" };
     let dir = root.join("dist").join(outdir).join(&feature);
