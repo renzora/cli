@@ -202,18 +202,37 @@ fn container_name(root: &Path) -> String {
 /// After rebuilding the image (e.g. editing the Dockerfile), run
 /// `renzora destroy && renzora init` to recreate the container against it.
 fn ensure_up(root: &Path, name: &str) {
-    if docker_out(&["images", "-q", IMAGE]).trim().is_empty() {
-        // Prefer the prebuilt toolchain image from the registry: a ~3 GB pull
-        // takes a few minutes, versus 10-25 min to build osxcross/NDK/xwin/etc.
-        // from scratch. Fall back to building it locally if the pull fails
-        // (offline, or an engine dev who has edited the Dockerfile).
-        eprintln!("Fetching toolchain image {IMAGE} (first time)...");
-        if !pull_image() {
-            eprintln!("Could not pull {IMAGE} — building it locally instead (this takes a while)...");
-            build_image(root);
+    // The image is tagged with a hash of the Dockerfile, so a checkout's
+    // toolchain image is pinned to its source. After a `git pull` that changes
+    // the Dockerfile the tag changes; we pull the matching image and recreate
+    // the container, keeping source and toolchain in lockstep. A locally edited
+    // Dockerfile yields a tag that isn't on the registry, so the pull misses
+    // and we build it locally (the fork path).
+    let image = image_ref(root);
+
+    if docker_out(&["images", "-q", &image]).trim().is_empty() {
+        // A ~3 GB pull beats a 10-25 min local build of osxcross/NDK/xwin/etc.
+        eprintln!("Fetching toolchain image {image} ...");
+        if !pull_image(&image) {
+            eprintln!("Could not pull {image} — building it locally instead (this takes a while)...");
+            build_image(root, &image);
         }
     }
+
     let by_name = format!("name=^{name}$");
+    if !docker_out(&["ps", "-aq", "-f", &by_name]).trim().is_empty() {
+        // Recreate the container if it was created from a different image than
+        // we now want (the Dockerfile changed since it was created). The
+        // `target/` volume persists across this, so the build cache survives.
+        let current = docker_out(&["inspect", name, "--format", "{{.Config.Image}}"])
+            .trim()
+            .to_string();
+        if current != image {
+            eprintln!("Toolchain image changed ({current} -> {image}) — recreating container {name}...");
+            docker(&["rm", "-f", name]);
+        }
+    }
+
     if docker_out(&["ps", "-aq", "-f", &by_name]).trim().is_empty() {
         eprintln!("Creating container {name}...");
         let mount = format!("{}:/app/src", root.display());
@@ -227,7 +246,7 @@ fn ensure_up(root: &Path, name: &str) {
         let st = Command::new("docker")
             .args([
                 "create", "--name", name, "-v", &mount, "-v", &target_mount, "-w",
-                "/app/src", IMAGE, "sleep", "infinity",
+                "/app/src", &image, "sleep", "infinity",
             ])
             .status()
             .unwrap_or_else(|e| fail(format!("docker create failed: {e}")));
@@ -238,27 +257,49 @@ fn ensure_up(root: &Path, name: &str) {
     docker(&["start", name]);
 }
 
+/// The toolchain image ref for this checkout: `ghcr.io/renzora/engine:<tag>`
+/// where `<tag>` is a hash of the Dockerfile (so the image is pinned to the
+/// source). Falls back to `:latest` if the Dockerfile can't be read.
+fn image_ref(root: &Path) -> String {
+    match dockerfile_tag(root) {
+        Some(tag) => format!("{IMAGE}:{tag}"),
+        None => format!("{IMAGE}:latest"),
+    }
+}
+
+/// First 12 hex chars of the SHA-256 of the Dockerfile, with `\r` stripped so
+/// the tag is identical on every platform (Windows checkouts may have CRLF)
+/// and matches the tag CI computes on Linux. Mirrors the CI workflow's
+/// `tr -d '\r' < Dockerfile | sha256sum | cut -c1-12`.
+fn dockerfile_tag(root: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(root.join(DOCKERFILE)).ok()?;
+    let normalized: Vec<u8> = bytes.into_iter().filter(|&b| b != b'\r').collect();
+    let digest = Sha256::digest(&normalized);
+    Some(digest.iter().take(6).map(|b| format!("{b:02x}")).collect())
+}
+
 /// Name of the per-container named volume that backs `/app/src/target`.
 fn target_volume(name: &str) -> String {
     format!("{name}-target")
 }
 
-/// `docker pull IMAGE`; returns true on success. Failures are quiet so the
+/// `docker pull <image>`; returns true on success. Failures are quiet so the
 /// caller can fall back to building locally.
-fn pull_image() -> bool {
+fn pull_image(image: &str) -> bool {
     Command::new("docker")
-        .args(["pull", IMAGE])
+        .args(["pull", image])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
 }
 
-/// Build the toolchain image from the Dockerfile (the offline / Dockerfile-edit
-/// fallback when the registry pull isn't available).
-fn build_image(root: &Path) {
+/// Build the toolchain image from the Dockerfile, tagged as `image` (the
+/// offline / Dockerfile-edit fallback when the registry pull isn't available).
+fn build_image(root: &Path, image: &str) {
     let st = Command::new("docker")
         .current_dir(root)
-        .args(["build", "-f", DOCKERFILE, "-t", IMAGE, "."])
+        .args(["build", "-f", DOCKERFILE, "-t", image, "."])
         .status()
         .unwrap_or_else(|e| fail(format!("docker build failed to start (is Docker installed/running?): {e}")));
     if !st.success() {

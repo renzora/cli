@@ -1,6 +1,6 @@
 [package]
 name = "renzora"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "CLI for the Renzora game engine — scaffold projects and drive the pinned containerized toolchain."
 license = "MIT OR Apache-2.0"
@@ -18,3 +18,6 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+# Tiny, pure-Rust SHA-256 (no TLS/async) to tag the toolchain image by a hash
+# of the Dockerfile so a checkout pins to its matching image.
+sha2 = "0.10"
