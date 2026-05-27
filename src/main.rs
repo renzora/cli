@@ -79,6 +79,8 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
 
+    check_for_update();
+
     // `new` runs from anywhere — there's no engine checkout yet.
     if let Commands::New { name } = &cli.command {
         new_project(name);
@@ -332,4 +334,80 @@ fn docker_out(args: &[&str]) -> String {
 fn fail(msg: String) -> ! {
     eprintln!("renzora: {msg}");
     std::process::exit(1);
+}
+
+/// Best-effort, throttled check for a newer published CLI on crates.io.
+///
+/// Prints a one-line notice to stderr if a newer version exists. Throttled to
+/// once per day via a temp marker file so it never slows down normal use, and
+/// silently ignores any failure (offline, cargo missing, parse error). Uses
+/// `cargo search` so there's no HTTP dependency — cargo is always present since
+/// the CLI is installed with it.
+fn check_for_update() {
+    use std::time::Duration;
+
+    let marker = std::env::temp_dir().join("renzora-cli-update-check");
+    // Skip if we already checked within the last 24h.
+    if let Ok(modified) = std::fs::metadata(&marker).and_then(|m| m.modified()) {
+        if modified
+            .elapsed()
+            .map(|d| d < Duration::from_secs(86_400))
+            .unwrap_or(false)
+        {
+            return;
+        }
+    }
+    // Record the attempt up front so an offline/failed check doesn't retry for
+    // a day (writing also refreshes the mtime).
+    let _ = std::fs::write(&marker, b"");
+
+    let Ok(out) = Command::new("cargo")
+        .args(["search", "renzora", "--limit", "1"])
+        .output()
+    else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    // The matching line looks like: renzora = "0.1.4"    # description
+    let Some(latest) = text.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("renzora = \"")
+            .and_then(|rest| rest.split('"').next())
+    }) else {
+        return;
+    };
+
+    let current = env!("CARGO_PKG_VERSION");
+    if version_gt(latest, current) {
+        eprintln!(
+            "renzora: v{latest} is available (you have v{current}) — update with `cargo install renzora`"
+        );
+    }
+}
+
+/// True if dotted version `a` is strictly greater than `b` (numeric, by
+/// component). Pre-release suffixes are ignored. Good enough for a nag.
+fn version_gt(a: &str, b: &str) -> bool {
+    fn parts(v: &str) -> Vec<u64> {
+        v.split('.')
+            .map(|p| p.split('-').next().unwrap_or("").parse().unwrap_or(0))
+            .collect()
+    }
+    parts(a) > parts(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_gt;
+
+    #[test]
+    fn version_comparison() {
+        assert!(version_gt("0.1.4", "0.1.3"));
+        assert!(version_gt("0.2.0", "0.1.9"));
+        assert!(version_gt("0.1.10", "0.1.3")); // numeric, not lexical
+        assert!(version_gt("1.0.0", "0.9.9"));
+        assert!(!version_gt("0.1.3", "0.1.3")); // equal -> no nag
+        assert!(!version_gt("0.1.3", "0.1.4")); // local newer than published
+        assert!(!version_gt("0.1.4-beta", "0.1.4")); // pre-release suffix ignored
+    }
 }
