@@ -138,11 +138,15 @@ fn main() {
         }
         Commands::Clean => {
             ensure_up(&root, &name);
-            dexec(&name, "rm -rf target && echo 'target/ cleaned'");
+            // `target/` is a volume mountpoint, so clear its contents rather
+            // than removing the directory itself.
+            dexec(&name, "find target -mindepth 1 -maxdepth 1 -exec rm -rf {} + && echo 'target/ cleaned'");
         }
         Commands::Destroy => {
             docker(&["rm", "-f", &name]);
-            println!("Removed container {name}.");
+            // Remove the build-cache volume too — destroy is a full teardown.
+            docker(&["volume", "rm", "-f", &target_volume(&name)]);
+            println!("Removed container {name} and its build-cache volume.");
         }
     }
 }
@@ -211,10 +215,17 @@ fn ensure_up(root: &Path, name: &str) {
     if docker_out(&["ps", "-aq", "-f", &by_name]).trim().is_empty() {
         eprintln!("Creating container {name}...");
         let mount = format!("{}:/app/src", root.display());
+        // `target/` lives on a named volume (inside the Docker VM), not on the
+        // bind mount. On Windows/macOS the host bind mount crosses the VM
+        // boundary, which is slow for cargo's many-small-file churn; a volume
+        // runs at native Linux speed. `dist/` stays on the bind mount so built
+        // binaries remain visible on the host, and the volume persists across
+        // `renzora destroy` so the build cache survives container recreation.
+        let target_mount = format!("{}:/app/src/target", target_volume(name));
         let st = Command::new("docker")
             .args([
-                "create", "--name", name, "-v", &mount, "-w", "/app/src", IMAGE, "sleep",
-                "infinity",
+                "create", "--name", name, "-v", &mount, "-v", &target_mount, "-w",
+                "/app/src", IMAGE, "sleep", "infinity",
             ])
             .status()
             .unwrap_or_else(|e| fail(format!("docker create failed: {e}")));
@@ -223,6 +234,11 @@ fn ensure_up(root: &Path, name: &str) {
         }
     }
     docker(&["start", name]);
+}
+
+/// Name of the per-container named volume that backs `/app/src/target`.
+fn target_volume(name: &str) -> String {
+    format!("{name}-target")
 }
 
 /// `docker pull IMAGE`; returns true on success. Failures are quiet so the
