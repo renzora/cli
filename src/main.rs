@@ -318,15 +318,22 @@ fn run(root: &Path, name: &str, target: Option<String>) {
     let (platform, outdir, ext) = host_platform();
     dexec(name, &format!("/app/src/docker/build-all.sh dist {platform}"));
 
-    let bin = if feature == "runtime" { "renzora-runtime" } else { "renzora" };
-    let dir = root.join("dist").join(outdir).join(&feature);
-    let path = dir.join(format!("{bin}{ext}"));
+    // Operation Merge: one binary, one flat folder. The editor and the game are
+    // the SAME exe — the `renzora_editor` bundle dll sitting beside it makes it
+    // the editor; `--no-editor` runs that same exe as the game. There is no
+    // separate runtime build / `editor`+`runtime` subfolders anymore.
+    let dir = root.join("dist").join(outdir);
+    let path = dir.join(format!("renzora{ext}"));
     if !path.exists() {
         fail(format!("built binary not found: {}", path.display()));
     }
-    println!("Running {} ...", path.display());
-    let st = Command::new(&path)
-        .current_dir(&dir)
+    println!("Running {} ({feature}) ...", path.display());
+    let mut cmd = Command::new(&path);
+    cmd.current_dir(&dir);
+    if feature == "runtime" {
+        cmd.arg("--no-editor");
+    }
+    let st = cmd
         .status()
         .unwrap_or_else(|e| fail(format!("failed to launch {}: {e}", path.display())));
     std::process::exit(st.code().unwrap_or(0));
