@@ -339,13 +339,20 @@ fn run(root: &Path, name: &str, target: Option<String>) {
     // the editor; `--no-editor` runs that same exe as the game. There is no
     // separate runtime build / `editor`+`runtime` subfolders anymore.
     //
-    // On macOS the build wraps the output into a .app bundle; the exe and its
-    // dylibs/plugins live in Contents/MacOS.
-    let mut dir = root.join("dist").join(outdir);
-    if cfg!(target_os = "macos") {
-        dir = dir.join("Renzora Engine.app").join("Contents").join("MacOS");
-    }
-    let path = dir.join(format!("renzora{ext}"));
+    // The build wraps the editor output per platform: macOS into a .app
+    // bundle (exe + dylibs/plugins in Contents/MacOS), Linux into an AppImage
+    // AppDir whose AppRun sets LD_LIBRARY_PATH before exec'ing the binary —
+    // launch through those. Windows stays a flat folder (DLLs resolve from
+    // the exe's directory natively).
+    let dist = root.join("dist").join(outdir);
+    let (dir, bin) = if cfg!(target_os = "macos") {
+        (dist.join("Renzora Engine.app").join("Contents").join("MacOS"), "renzora".to_string())
+    } else if cfg!(target_os = "windows") {
+        (dist, format!("renzora{ext}"))
+    } else {
+        (dist.join("Renzora Engine.AppDir"), "AppRun".to_string())
+    };
+    let path = dir.join(&bin);
     if !path.exists() {
         fail(format!("built binary not found: {}", path.display()));
     }
