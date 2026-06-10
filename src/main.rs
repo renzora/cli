@@ -99,7 +99,9 @@ fn main() {
         }
         Commands::Build { platforms } => {
             ensure_up(&root, &name);
-            dexec(&name, &format!("/app/src/docker/build-all.sh dist {}", platforms.join(" ")));
+            // Via `bash` so a checkout without exec bits (e.g. extracted from
+            // a zip, or cloned before the repo set them) still works.
+            dexec(&name, &format!("bash /app/src/docker/build-all.sh dist {}", platforms.join(" ")));
         }
         Commands::Test { args } => {
             ensure_up(&root, &name);
@@ -330,7 +332,7 @@ fn run(root: &Path, name: &str, target: Option<String>) {
         fail("usage: renzora run [editor|runtime]".into());
     }
     let (platform, outdir, ext) = host_platform();
-    dexec(name, &format!("/app/src/docker/build-all.sh dist {platform}"));
+    dexec(name, &format!("bash /app/src/docker/build-all.sh dist {platform}"));
 
     // Operation Merge: one binary, one flat folder. The editor and the game are
     // the SAME exe — the `renzora_editor` bundle dll sitting beside it makes it
