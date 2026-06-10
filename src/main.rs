@@ -286,9 +286,23 @@ fn target_volume(name: &str) -> String {
 
 /// `docker pull <image>`; returns true on success. Failures are quiet so the
 /// caller can fall back to building locally.
+///
+/// On arm64 hosts (Apple Silicon), tags published before the image went
+/// multi-arch only have a linux/amd64 manifest, so the native pull fails with
+/// "no matching manifest". Rather than dropping straight to a slow local
+/// build, retry pinned to linux/amd64 — Docker Desktop runs it under Rosetta.
 fn pull_image(image: &str) -> bool {
-    Command::new("docker")
+    let native = Command::new("docker")
         .args(["pull", image])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if native || !cfg!(target_arch = "aarch64") {
+        return native;
+    }
+    eprintln!("No arm64 image for {image} — pulling linux/amd64 (runs emulated; on macOS enable Rosetta in Docker Desktop settings)...");
+    Command::new("docker")
+        .args(["pull", "--platform", "linux/amd64", image])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -344,11 +358,15 @@ fn host_platform() -> (&'static str, &'static str, &'static str) {
     if cfg!(target_os = "windows") {
         ("windows", "windows-x64", ".exe")
     } else if cfg!(target_os = "macos") {
+        // Pass the specific arch so `run` doesn't also cross-build the other
+        // macOS slice (bare `macos` expands to x64+arm64 in build-all.sh).
         if cfg!(target_arch = "aarch64") {
-            ("macos", "macos-arm64", "")
+            ("macos-arm64", "macos-arm64", "")
         } else {
-            ("macos", "macos-x64", "")
+            ("macos-x64", "macos-x64", "")
         }
+    } else if cfg!(target_arch = "aarch64") {
+        ("linux", "linux-arm64", "")
     } else {
         ("linux", "linux-x64", "")
     }
