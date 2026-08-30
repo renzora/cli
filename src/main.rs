@@ -140,15 +140,17 @@ fn main() {
         Commands::Run { target } => run(&root, target),
         Commands::Add { args } => {
             let name = linux_container(&root);
-            dexec(&name, &format!("bash docker/add-plugin.sh {}", args.join(" ")));
+            // `crates`, not just the new crate dir: the scaffold also rewrites
+            // crates/renzora_runtime/Cargo.toml to register the plugin.
+            dexec_owned(&name, &root, &format!("bash docker/add-plugin.sh {}", args.join(" ")), &["crates"]);
         }
         Commands::Remove { args } => {
             let name = linux_container(&root);
-            dexec(&name, &format!("bash docker/remove-plugin.sh {}", args.join(" ")));
+            dexec_owned(&name, &root, &format!("bash docker/remove-plugin.sh {}", args.join(" ")), &["crates"]);
         }
         Commands::Upx { args } => {
             let name = linux_container(&root);
-            dexec(&name, &format!("bash docker/upx-compress.sh {}", args.join(" ")));
+            dexec_owned(&name, &root, &format!("bash docker/upx-compress.sh {}", args.join(" ")), &["dist"]);
         }
         Commands::Shell => {
             let name = linux_container(&root);
@@ -444,7 +446,10 @@ fn build_cmd(root: &Path, tokens: Vec<String>) {
         for plat in ALL_PLATFORMS {
             ensure_up(root, plat);
             let name = container_name(root, plat);
-            dexec(&name, &format!("bash /app/src/docker/build-all.sh dist {plat}"));
+            // `plugins/target` too: the standalone-plugin workspace keeps its
+            // cargo target dir on the bind mount (see plugins/.cargo/config.toml
+            // in the engine), so a container build roots that as well.
+            dexec_owned(&name, root, &format!("bash /app/src/docker/build-all.sh dist {plat}"), &["dist", "plugins/target"]);
         }
         return;
     }
@@ -464,7 +469,7 @@ fn build_cmd(root: &Path, tokens: Vec<String>) {
         ensure_up(root, img);
         let name = container_name(root, img);
         // Via `bash` so a checkout without exec bits still works.
-        dexec(&name, &format!("bash /app/src/docker/build-all.sh dist {}", toks.join(" ")));
+        dexec_owned(&name, root, &format!("bash /app/src/docker/build-all.sh dist {}", toks.join(" ")), &["dist", "plugins/target"]);
     }
 }
 
@@ -479,7 +484,7 @@ fn run(root: &Path, target: Option<String>) {
     if feature != "editor" && feature != "runtime" {
         fail("usage: renzora run [editor|runtime]".into());
     }
-    dexec(&name, &format!("bash /app/src/docker/build-all.sh dist {}", host.build_arg));
+    dexec_owned(&name, root, &format!("bash /app/src/docker/build-all.sh dist {}", host.build_arg), &["dist", "plugins/target"]);
 
     // Operation Merge: one binary, one flat folder. The editor and the game are
     // the SAME exe — the `renzora_editor` bundle dll beside it makes it the
@@ -561,11 +566,69 @@ fn host_platform() -> HostPlatform {
 
 // ── Docker helpers ───────────────────────────────────────────────────────────
 
+/// Hand bind-mount paths a container command wrote back to the host user.
+///
+/// The toolchain containers run as root and `/app/src` is a bind mount of the
+/// checkout, so on Linux everything a build writes there — `dist/`, scaffolded
+/// crates — lands on the host owned by `root:root`. The visible casualty is
+/// `renzora run`: the editor's plugin loader stages a shadow copy of every
+/// plugin into `plugins/.reload/` before loading it, and a root-owned `dist/`
+/// makes that fail with `Permission denied` for every single plugin, so the
+/// editor boots with no Lua, no audio and no post-processing. A root-owned
+/// `dist/` also can't be deleted by the user without sudo.
+///
+/// Running the whole container as the host uid (`docker create --user`) is the
+/// obvious alternative and doesn't work here: the images keep root-owned
+/// toolchains (rustup, osxcross, xwin, the NDK) and cargo's caches under
+/// root's home. So instead chown just the paths a command wrote, from inside
+/// the container, where we are root anyway.
+///
+/// The target uid/gid come from the checkout directory's owner rather than the
+/// calling user, so a sudo invocation still hands files back to whoever owns
+/// the checkout. Best-effort by design — an ownership fixup must never fail
+/// the build that just succeeded. Unix hosts only: on Windows the bind mount
+/// has no unix ownership to fix, and macOS's VirtioFS already maps container
+/// writes to the host user (the chown is a harmless no-op there).
+fn chown_to_host(name: &str, root: &Path, paths: &[&str]) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = root.metadata() else { return };
+        let (uid, gid) = (meta.uid(), meta.gid());
+        if uid == 0 {
+            return; // checkout owned by root: nothing to hand back
+        }
+        let cmd = format!("chown -R {uid}:{gid} {} 2>/dev/null || true", paths.join(" "));
+        let _ = Command::new("docker")
+            .args(["exec", name, "bash", "-c", &cmd])
+            .output();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (name, root, paths);
+    }
+}
+
 fn dexec(name: &str, cmd: &str) {
     let st = Command::new("docker")
         .args(["exec", name, "bash", "-c", cmd])
         .status()
         .unwrap_or_else(|e| fail(format!("docker exec failed: {e}")));
+    if !st.success() {
+        std::process::exit(st.code().unwrap_or(1));
+    }
+}
+
+/// [`dexec`] for commands that write to the bind mount: chowns `paths` back to
+/// the host user afterwards. The chown runs even when the command failed —
+/// a failed build has usually written partial output, and leaving that
+/// root-owned is exactly the mess this exists to prevent.
+fn dexec_owned(name: &str, root: &Path, cmd: &str, paths: &[&str]) {
+    let st = Command::new("docker")
+        .args(["exec", name, "bash", "-c", cmd])
+        .status()
+        .unwrap_or_else(|e| fail(format!("docker exec failed: {e}")));
+    chown_to_host(name, root, paths);
     if !st.success() {
         std::process::exit(st.code().unwrap_or(1));
     }
