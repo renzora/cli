@@ -1,8 +1,8 @@
 [package]
 name = "renzora"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "CLI for the Renzora game engine — scaffold projects and drive the pinned containerized toolchain."
+description = "CLI for the Renzora game engine — scaffold projects, drive the pinned containerized toolchain, and publish plugins to the marketplace."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/renzora/cli"
 homepage = "https://github.com/renzora/engine"
@@ -21,3 +21,15 @@ clap = { version = "4", features = ["derive"] }
 # Tiny, pure-Rust SHA-256 (no TLS/async) to tag the toolchain image by a hash
 # of the Dockerfile so a checkout pins to its matching image.
 sha2 = "0.10"
+# `renzora publish` talks to the marketplace. ureq is blocking and brings no
+# async runtime with it, which keeps this a process-orchestration binary that
+# happens to make a few HTTP calls rather than a tokio application.
+ureq = { version = "3", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Reading `[package.metadata.renzora]` out of the crate being published.
+toml = "0.8"
+# Packaging that crate into the single .zip the marketplace stores.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# `exclude`/`include` globs in the manifest.
+glob = "0.3"

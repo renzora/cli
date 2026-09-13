@@ -29,6 +29,8 @@ use std::process::{Command, ExitStatus};
 
 use clap::{Parser, Subcommand};
 
+mod publish;
+
 /// GHCR image prefix; each image is `<IMAGE>/<platform>` (+ `/base`).
 const IMAGE: &str = "ghcr.io/renzora";
 /// Repo-root sentinel + the file whose hash is the base tag.
@@ -97,6 +99,51 @@ enum Commands {
     Destroy,
     /// Remove this checkout's stale (non-current) toolchain images.
     Prune,
+    /// Store a marketplace API token for publishing.
+    Login {
+        /// Marketplace to log in to (defaults to https://renzora.com).
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Forget the stored marketplace token.
+    Logout,
+    /// Print who the stored token belongs to.
+    Whoami,
+    /// Publish a plugin or asset directory to the marketplace.
+    ///
+    /// Reads `[package.metadata.renzora]` from the directory's Cargo.toml (or a
+    /// renzora.toml where there is no crate), packages the directory into one
+    /// zip, and either creates the listing or adds this version to the listing
+    /// you already own. Published versions are never overwritten.
+    Publish {
+        /// Directories to publish (defaults to the current one).
+        paths: Vec<String>,
+        /// Publish every directory one level under each path that has a
+        /// manifest — an editor's whole `plugins/` folder in one command.
+        #[arg(long)]
+        all: bool,
+        /// Package and report, but upload nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the marketplace's categories and exit.
+        #[arg(long)]
+        list_categories: bool,
+        /// Release notes. Defaults to this version's CHANGELOG.md section.
+        #[arg(long)]
+        notes: Option<String>,
+        /// Read the release notes from a file.
+        #[arg(long, conflicts_with = "notes")]
+        notes_file: Option<String>,
+        /// Also write the package to this path, for inspection.
+        #[arg(long)]
+        out: Option<String>,
+        /// Publish even though the version is behind the listing's current one.
+        #[arg(long)]
+        allow_older: bool,
+        /// Don't ask before publishing.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 fn main() {
@@ -110,11 +157,47 @@ fn main() {
         return;
     }
 
+    // Publishing is about a plugin/asset directory, which is usually somewhere
+    // else entirely — these commands must not demand an engine checkout.
+    match cli.command {
+        Commands::Login { url } => return unwrap_or_fail(publish::login(url)),
+        Commands::Logout => return unwrap_or_fail(publish::logout()),
+        Commands::Whoami => return unwrap_or_fail(publish::whoami()),
+        Commands::Publish {
+            paths,
+            all,
+            dry_run,
+            list_categories,
+            notes,
+            notes_file,
+            out,
+            allow_older,
+            yes,
+        } => {
+            return unwrap_or_fail(publish::publish(publish::PublishArgs {
+                paths,
+                all,
+                dry_run,
+                list_categories,
+                notes,
+                notes_file,
+                out,
+                allow_older,
+                yes,
+            }))
+        }
+        _ => {}
+    }
+
     // Everything else operates on an existing engine checkout.
     let root = find_repo_root();
 
     match cli.command {
-        Commands::New { .. } => unreachable!("handled above"),
+        Commands::New { .. }
+        | Commands::Login { .. }
+        | Commands::Logout
+        | Commands::Whoami
+        | Commands::Publish { .. } => unreachable!("handled above"),
         Commands::Init => {
             let host = host_platform();
             ensure_up(&root, host.image);
@@ -440,18 +523,37 @@ fn linux_container(root: &Path) -> String {
 /// `renzora build [platforms]` — bare = every platform; else the listed tokens
 /// grouped by their image so each container is brought up once.
 fn build_cmd(root: &Path, tokens: Vec<String>) {
-    if tokens.is_empty() {
-        for plat in ALL_PLATFORMS {
-            ensure_up(root, plat);
-            let name = container_name(root, plat);
-            dexec(&name, &format!("bash /app/src/docker/build-all.sh dist {plat}"));
-        }
-        return;
+    // No args means every platform, and the host is one of them — so normalise
+    // to a token list first and let one rule apply to both cases.
+    let tokens: Vec<String> = if tokens.is_empty() {
+        ALL_PLATFORMS.iter().map(|p| p.to_string()).collect()
+    } else {
+        tokens
+    };
+
+    let host = host_platform();
+    let (native, cross): (Vec<String>, Vec<String>) =
+        tokens.into_iter().partition(|t| is_host_token(t, &host));
+
+    // The host platform never enters a container. A container is a
+    // cross-compiler and there is nothing to cross-compile for the machine you
+    // are sitting at — but more than that, it *cannot* produce a usable editor
+    // for you. An editor ships a plugin SDK so it can compile native plugins and
+    // Rust scripts, and an SDK's proc-macro dylibs belong to whatever ran the
+    // compiler: build Windows in the Linux container and the SDK carries Linux
+    // `.so` proc macros that your `rustc` cannot load. `docker/build-all.sh`
+    // therefore stages runtimes only, so routing the host here is what makes
+    // `renzora build <your own platform>` produce an editor at all.
+    //
+    // It is also simply faster — no image pull, no container, no bind mount.
+    if !native.is_empty() {
+        println!("Building {} natively (no container) ...", host.outdir);
+        native_stage(root);
     }
 
-    // Group tokens by image, preserving first-seen order.
+    // Group the rest by image, preserving first-seen order.
     let mut groups: Vec<(&'static str, Vec<String>)> = Vec::new();
-    for tok in tokens {
+    for tok in cross {
         match image_for_token(&tok) {
             Some(img) => match groups.iter_mut().find(|(i, _)| *i == img) {
                 Some(g) => g.1.push(tok),
@@ -468,18 +570,63 @@ fn build_cmd(root: &Path, tokens: Vec<String>) {
     }
 }
 
-/// Cross-build for the host platform, then run the produced binary natively (the
-/// GPU stays on the host; the container can't display).
+/// Does this token name the platform we are running on?
+///
+/// Both spellings count, which on Windows means `windows` as well as
+/// `windows-x64` — the Windows image only ever builds the x64 slice, so there
+/// the family name and the host are the same thing.
+///
+/// Elsewhere they are not, and the difference is deliberate. `linux` means BOTH
+/// Linux arches and `macos` means both macOS slices, so neither is satisfiable
+/// natively on one machine; only the exact `linux-x64` / `macos-arm64` form
+/// routes here, and the family name still goes to the container that can build
+/// every slice of it.
+fn is_host_token(tok: &str, host: &HostPlatform) -> bool {
+    tok == host.outdir || tok == host.build_arg
+}
+
+/// Build and stage the host platform with `cargo renzora dist --bundle` — the
+/// same xtask a contributor runs directly.
+///
+/// `--bundle` because the container wraps its output per platform (an AppImage
+/// on Linux, a `.app` on macOS) and several things read the binary from inside
+/// that bundle: `run` below, the editor's export-template scan, and the release
+/// packaging. Staging flat would produce a tree that works but that none of them
+/// can find.
+fn native_stage(root: &Path) {
+    let st = Command::new("cargo")
+        .current_dir(root)
+        .args(["renzora", "dist", "--bundle"])
+        .status()
+        .unwrap_or_else(|e| {
+            fail(format!(
+                "could not run cargo: {e}\n\
+                 The host platform is built natively now, which needs a Rust \
+                 toolchain on PATH. Install rustup (https://rustup.rs); \
+                 rust-toolchain.toml in the checkout pins the version."
+            ))
+        });
+    if !st.success() {
+        std::process::exit(st.code().unwrap_or(1));
+    }
+}
+
+/// Build the host platform natively, then run what it produced.
+///
+/// This used to build in the container and launch the result on the host, for
+/// the GPU — a container cannot display. It now does not use the container at
+/// all, because that build no longer contains an editor to launch: an editor
+/// carries a plugin SDK, an SDK cannot be cross-built, and so the container
+/// stages runtimes only. `cargo renzora` is both the correct build and the
+/// faster one.
 fn run(root: &Path, target: Option<String>) {
     let host = host_platform();
-    ensure_up(root, host.image);
-    let name = container_name(root, host.image);
 
     let feature = target.unwrap_or_else(|| "editor".into());
     if feature != "editor" && feature != "runtime" {
         fail("usage: renzora run [editor|runtime]".into());
     }
-    dexec(&name, &format!("bash /app/src/docker/build-all.sh dist {}", host.build_arg));
+    native_stage(root);
 
     // Operation Merge: one binary, one flat folder. The editor and the game are
     // the SAME exe — the `renzora_editor` bundle dll beside it makes it the
@@ -591,6 +738,14 @@ fn fail(msg: String) -> ! {
     std::process::exit(1);
 }
 
+/// Unwrap a command that reports its own errors as text, or exit non-zero with
+/// the message the way every other failure path here does.
+fn unwrap_or_fail(result: Result<(), String>) {
+    if let Err(msg) = result {
+        fail(msg);
+    }
+}
+
 /// Best-effort, throttled self-update from crates.io.
 ///
 /// When a newer published CLI exists and stdin is a TTY, prompt to update and,
@@ -672,7 +827,7 @@ fn check_for_update() {
 
 /// True if dotted version `a` is strictly greater than `b` (numeric, by
 /// component). Pre-release suffixes are ignored. Good enough for a nag.
-fn version_gt(a: &str, b: &str) -> bool {
+pub(crate) fn version_gt(a: &str, b: &str) -> bool {
     fn parts(v: &str) -> Vec<u64> {
         v.split('.')
             .map(|p| p.split('-').next().unwrap_or("").parse().unwrap_or(0))
