@@ -116,12 +116,24 @@ enum Commands {
     /// zip, and either creates the listing or adds this version to the listing
     /// you already own. Published versions are never overwritten.
     Publish {
-        /// Directories to publish (defaults to the current one).
+        /// Directories to publish (defaults to the current one). With --repo,
+        /// these name directories inside the repository.
         paths: Vec<String>,
+        /// Publish from a git repository rather than the working directory, so
+        /// what ships is a commit and not whatever is lying around locally.
+        #[arg(long, value_name = "URL")]
+        repo: Option<String>,
+        /// Which branch, tag or commit of it (default: its default branch).
+        #[arg(long = "ref", value_name = "REF", requires = "repo")]
+        git_ref: Option<String>,
         /// Publish every directory one level under each path that has a
         /// manifest — an editor's whole `plugins/` folder in one command.
         #[arg(long)]
         all: bool,
+        /// Replace listings' cover images only. No packaging, no release, and
+        /// so no version bump — a cover is not a new version.
+        #[arg(long)]
+        thumbnails: bool,
         /// Package and report, but upload nothing.
         #[arg(long)]
         dry_run: bool,
@@ -165,7 +177,10 @@ fn main() {
         Commands::Whoami => return unwrap_or_fail(publish::whoami()),
         Commands::Publish {
             paths,
+            repo,
+            git_ref,
             all,
+            thumbnails,
             dry_run,
             list_categories,
             notes,
@@ -176,7 +191,10 @@ fn main() {
         } => {
             return unwrap_or_fail(publish::publish(publish::PublishArgs {
                 paths,
+                repo,
+                git_ref,
                 all,
+                thumbnails,
                 dry_run,
                 list_categories,
                 notes,

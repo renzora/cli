@@ -12,6 +12,7 @@
 //! a title instead would be guessing, since a listing is named by a person and
 //! renamed later (`crt` is listed as "CRT Fx").
 
+pub mod checkout;
 pub mod credentials;
 pub mod manifest;
 pub mod package;
@@ -20,6 +21,7 @@ pub mod registry;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use checkout::Checkout;
 use credentials::Credentials;
 use manifest::Manifest;
 use registry::{Multipart, Registry};
@@ -103,7 +105,12 @@ pub fn whoami() -> Result<(), String> {
 
 pub struct PublishArgs {
     pub paths: Vec<String>,
+    /// Publish from this git repository instead of from the working directory.
+    pub repo: Option<String>,
+    /// Which branch, tag or commit of it. `None` is the default branch.
+    pub git_ref: Option<String>,
     pub all: bool,
+    pub thumbnails: bool,
     pub dry_run: bool,
     pub allow_older: bool,
     pub list_categories: bool,
@@ -118,12 +125,118 @@ pub fn publish(args: PublishArgs) -> Result<(), String> {
         return list_categories();
     }
 
-    let targets = resolve_targets(&args.paths, args.all)?;
+    // Held for the whole run: dropping it deletes the checkout, so it has to
+    // outlive the packaging that reads from it.
+    let checkout = match &args.repo {
+        Some(url) => {
+            status("Fetching", url);
+            let checkout = Checkout::fetch(url, args.git_ref.as_deref())?;
+            status("Fetched", &checkout.commit[..12.min(checkout.commit.len())]);
+            Some(checkout)
+        }
+        None => None,
+    };
+
+    // With a repository, a path on the command line names a directory *inside*
+    // it — `--repo <url> clouds` is the repository's `clouds`, not a local one.
+    let paths: Vec<String> = match &checkout {
+        Some(c) if args.paths.is_empty() => vec![c.dir.to_string_lossy().to_string()],
+        Some(c) => args.paths.iter().map(|p| c.resolve(p)).collect(),
+        None => args.paths.clone(),
+    };
+
+    let targets = resolve_targets(&paths, args.all)?;
+
+    if args.thumbnails {
+        return sync_thumbnails(&targets, args.yes);
+    }
+
     match targets.as_slice() {
         [] => Err("nothing to publish".into()),
         [one] => publish_one(one.clone(), &args),
         many => publish_many(many, &args),
     }
+}
+
+/// Replace listings' cover images and nothing else.
+///
+/// A cover is not a new version of a plugin, and a published version can never
+/// be replaced — so pushing one as a release would mean bumping the version of
+/// everything that gained a picture, and leaving a release behind whose only
+/// change was the picture. `PUT /:id/files` takes a thumbnail on its own and
+/// only touches an asset's files when the request carries some.
+fn sync_thumbnails(dirs: &[PathBuf], yes: bool) -> Result<(), String> {
+    let creds = credentials::load()?;
+    let registry = Registry::new(&creds);
+    let mine = registry.my_assets()?;
+
+    // Everything is resolved before anything is sent, so a directory with no
+    // listing or no image is reported rather than discovered halfway through.
+    let mut ready: Vec<(Manifest, registry::Asset, PathBuf)> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+
+    for dir in dirs {
+        let manifest = manifest::load(dir)?;
+        let Some(path) = manifest.thumbnail.clone() else {
+            skipped.push(format!("{} has no thumbnail", manifest.marketplace_id));
+            continue;
+        };
+        match mine
+            .iter()
+            .find(|a| a.marketplace_id.eq_ignore_ascii_case(&manifest.marketplace_id))
+        {
+            Some(asset) => ready.push((manifest, asset.clone(), path)),
+            None => skipped.push(format!(
+                "{} is not one of your listings yet — publish it first",
+                manifest.marketplace_id
+            )),
+        }
+    }
+
+    for reason in &skipped {
+        println!("{:>VERB$} {reason}", "Skipped");
+    }
+    if ready.is_empty() {
+        return Err("nothing to upload".into());
+    }
+
+    let total: u64 = ready
+        .iter()
+        .filter_map(|(_, _, p)| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum();
+    status(
+        "Uploading",
+        format!("{} covers, {}", ready.len(), package::human_size(total)),
+    );
+    if !confirm(yes, &format!("Replace {} cover images?", ready.len()))? {
+        return Err("cancelled".into());
+    }
+
+    let mut failed = Vec::new();
+    for (manifest, asset, path) in &ready {
+        let name = filename(path);
+        match read(path).and_then(|bytes| registry.update_thumbnail(&asset.id, &name, &bytes)) {
+            Ok(()) => println!("{:>VERB$} {:<24} {name}", "Replaced", asset.name),
+            Err(e) => {
+                println!("{:>VERB$} {:<24} {e}", "Failed", asset.name);
+                failed.push(manifest.marketplace_id.clone());
+            }
+        }
+    }
+
+    println!();
+    status(
+        "Finished",
+        format!(
+            "{} replaced, {} failed",
+            ready.len() - failed.len(),
+            failed.len()
+        ),
+    );
+    if failed.is_empty() {
+        return Ok(());
+    }
+    Err(format!("these did not upload: {}", failed.join(", ")))
 }
 
 /// Every directory to publish, from the paths given.
@@ -151,15 +264,32 @@ fn resolve_targets(paths: &[String], all: bool) -> Result<Vec<PathBuf>, String> 
     for root in &roots {
         let entries = std::fs::read_dir(root)
             .map_err(|e| format!("could not read {}: {e}", root.display()))?;
-        let mut children: Vec<PathBuf> = entries
+        let all_dirs: Vec<PathBuf> = entries
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.is_dir() && has_manifest(p))
             .collect();
+
+        // A sweep takes only what has claimed an id. Naming a directory
+        // outright still publishes it or explains why it cannot — saying so is
+        // an instruction, where sweeping a folder is not.
+        let mut children: Vec<PathBuf> = all_dirs
+            .iter()
+            .filter(|p| manifest::declares_listing(p))
+            .cloned()
+            .collect();
+        let passed_over = all_dirs.len() - children.len();
+        if passed_over > 0 {
+            println!(
+                "{:>VERB$} {passed_over} of {} directories claim no marketplace id",
+                "Passed over",
+                all_dirs.len()
+            );
+        }
         if children.is_empty() {
             return Err(format!(
-                "no publishable directories under {} — --all looks one level \
-                 down for a Cargo.toml or renzora.toml.",
+                "nothing to publish under {} — --all looks one level \
+                 down for a directory whose manifest sets `marketplace_id`.",
                 root.display()
             ));
         }

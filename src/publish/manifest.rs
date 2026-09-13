@@ -88,6 +88,28 @@ impl Manifest {
     }
 }
 
+/// Does this directory claim a marketplace id?
+///
+/// The id is what makes a directory a listing, so its absence is how a sweep
+/// tells a plugin meant for the marketplace from one that merely lives beside
+/// it. A repository of plugins holds both — the engine's own `unsupported-targets`
+/// gate lives in the same section — and `--all` refusing the whole run because
+/// of them would make it unusable on exactly the repository it is for.
+///
+/// Deliberately a text scan: a directory that is not being published should not
+/// have to parse cleanly to be skipped.
+pub fn declares_listing(dir: &Path) -> bool {
+    for name in ["Cargo.toml", "renzora.toml"] {
+        let Ok(text) = std::fs::read_to_string(dir.join(name)) else {
+            continue;
+        };
+        if text.lines().any(|l| l.trim_start().starts_with("marketplace_id")) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Load the manifest for `dir`, preferring `Cargo.toml`.
 pub fn load(dir: &Path) -> Result<Manifest, String> {
     let cargo = dir.join("Cargo.toml");
@@ -301,8 +323,12 @@ fn from_standalone(dir: &Path, path: &Path) -> Result<Manifest, String> {
 // ── Shared shape ───────────────────────────────────────────────────────────
 
 /// The `[package.metadata.renzora]` table, and the whole of a `renzora.toml`.
+///
+/// Unknown keys are collected rather than rejected, because this section is not
+/// only ours: the engine's exporter reads `unsupported-targets` from it to
+/// decide which plugins a given target can build. Refusing what we do not
+/// recognise made those plugins unpublishable.
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Section {
     name: Option<String>,
     description: Option<String>,
@@ -336,7 +362,15 @@ struct Section {
     include: Vec<String>,
     #[serde(default)]
     exclude: Vec<String>,
+    /// Everything else in the table. Kept so a typo can still be pointed at
+    /// without a key belonging to someone else being an error.
+    #[serde(flatten)]
+    other: toml::Table,
 }
+
+/// Keys in this section that belong to something other than publishing, so
+/// finding one is not a mistake worth mentioning.
+const FOREIGN_KEYS: &[&str] = &["unsupported-targets"];
 
 /// What `[package]` (or the top of a `renzora.toml`) contributes.
 struct Defaults {
@@ -353,6 +387,22 @@ struct Defaults {
 }
 
 fn build(dir: &Path, source: &Path, s: Section, d: Defaults) -> Result<Manifest, String> {
+    // A misspelled key would otherwise do nothing at all, silently: an asset
+    // meant to cost credits published free, or a title never applied.
+    let unknown: Vec<&str> = s
+        .other
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !FOREIGN_KEYS.contains(k))
+        .collect();
+    if !unknown.is_empty() {
+        eprintln!(
+            "renzora: {} sets {} under [package.metadata.renzora], which              publishing does not read. A misspelling here is silent, so check              it is meant for something else.",
+            source.display(),
+            unknown.join(", ")
+        );
+    }
+
     let category = s
         .category
         .map(|c| c.trim().to_lowercase())

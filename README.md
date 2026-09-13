@@ -115,12 +115,47 @@ to retitle a listing somebody named on the website.
 
 | Flag | |
 |---|---|
-| `--all` | Publish every directory one level down — a whole `plugins/` folder |
+| `--all` | Publish every directory one level down that claims a `marketplace_id` |
+| `--repo <url>` | Publish from a git repository instead of the working directory |
+| `--ref <ref>` | Which branch, tag or commit of it |
+| `--thumbnails` | Replace cover images only — no release, no version bump |
 | `--dry-run` | Do everything except the upload (see below) |
 | `--allow-older` | Publish behind the listing's current version |
 | `--out <path>` | Also write the zip out, to inspect what would ship |
 | `--list-categories` | Print the marketplace's categories |
 | `-y`, `--yes` | Don't ask before publishing |
+
+### Publishing from a repository
+
+```sh
+renzora publish --repo https://github.com/renzora/plugins --all
+renzora publish --repo https://github.com/renzora/plugins --ref v1.2.0 clouds
+```
+
+The repository is fetched to a temporary directory and published from there, so
+what ships is a commit rather than whatever is lying around locally — no build
+output, no half-finished edit. The run prints the commit it resolved. Paths
+given alongside `--repo` name directories *inside* it.
+
+`--ref` takes a branch, a tag or a raw commit. `git` is shelled out to rather
+than linked, so a private repository works through your existing credentials or
+SSH agent and the CLI never handles a secret. This is the form a CI job wants,
+with the API token in a secret and nothing else to set up.
+
+`--all` sweeps only directories whose manifest sets a `marketplace_id`;
+anything else in the repository is passed over and reported. Naming a directory
+outright still publishes it or explains why it cannot — saying a name is an
+instruction, where sweeping a folder is not.
+
+### Covers
+
+```sh
+renzora publish path/to/plugins --all --thumbnails
+```
+
+Replaces listings' cover images and nothing else. A cover is not a new version
+of a plugin, and a published version can never be replaced, so pushing one as a
+release would mean bumping the version of everything that gained a picture.
 
 ### Dry runs
 
