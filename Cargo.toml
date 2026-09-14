@@ -1,6 +1,6 @@
 [package]
 name = "renzora"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "CLI for the Renzora game engine — scaffold projects, drive the pinned containerized toolchain, and publish plugins to the marketplace."
 license = "MIT OR Apache-2.0"

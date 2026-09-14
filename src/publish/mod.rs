@@ -609,18 +609,67 @@ impl Catalog {
 }
 
 
+/// Where an engine tag sits in the ordering, by its trailing digits.
+///
+/// `r1-alpha8` -> `("r1-alpha", 8)`, so `r1-alpha10` sorts above `r1-alpha7`,
+/// which a string compare gets backwards. `None` for a tag with no trailing
+/// number, which callers read as "cannot tell" and never as a failure.
+///
+/// The same split the editor makes in `installed::release_order`. It has to be,
+/// or the tool and the thing it publishes for would disagree about which of two
+/// engines is newer.
+fn engine_order(tag: &str) -> Option<(String, u32)> {
+    let tag = tag.trim();
+    if tag.is_empty() {
+        return None;
+    }
+    let digits_start = tag
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_ascii_digit())
+        .map(|(i, _)| i)
+        .last()?;
+    let (prefix, num) = tag.split_at(digits_start);
+    num.parse::<u32>().ok().map(|n| (prefix.to_string(), n))
+}
+
+/// Is engine `a` strictly newer than engine `b`?
+///
+/// An empty tag means "any engine", which is the OLDEST possible line: a
+/// release with no floor is offered to everybody, including the oldest editor
+/// anybody is running.
+fn engine_newer(a: &str, b: &str) -> bool {
+    match (engine_order(a), engine_order(b)) {
+        (Some((ap, an)), Some((bp, bn))) if ap == bp => an > bn,
+        // Any real tag is newer than "no floor at all", which is the oldest
+        // line there is. A tag that simply will not parse is left alone rather
+        // than guessed at, so an unfamiliar scheme never blocks a publish.
+        (Some(_), None) => b.trim().is_empty(),
+        _ => false,
+    }
+}
+
 /// Refuse a version the listing cannot sensibly take.
 ///
 /// Two separate problems, and the server only catches one of them. It rejects a
 /// version that already exists — but only once the archive has been uploaded,
-/// so the same check here saves the upload. What it does *not* check at all is
-/// ordering: `create_current` makes whatever arrives the current release, so
-/// publishing 0.1.0 over 1.0.0 succeeds and quietly makes 0.1.0 the version
-/// every new buyer downloads. Nothing undoes that — a release cannot be
-/// deleted while it is current.
+/// so the same check here saves the upload. What it does *not* check is
+/// ordering, and ordering is what decides which release an engine resolves.
 ///
-/// Publishing behind the current version is still legitimate (a fix to an
-/// older line, once 2.0 is out), so `--allow-older` says so out loud.
+/// The rule that matters is not "newer than the newest", it is **newer than the
+/// newest on your own line, and older than everything on any newer line**.
+///
+/// Resolution picks the highest version among releases an engine can run, so a
+/// release built for r1-alpha7 with a version ABOVE an r1-alpha8 release wins
+/// for r1-alpha8 users too: they can run both, and yours sorts higher. That
+/// hands the newer engine the older code, silently, and it is the one mistake
+/// this arrangement makes easy. Publishing 1.0.11 on the r1-alpha7 line while
+/// 2.0.0 sits on r1-alpha8 is fine; publishing 3.0.0 there is not.
+///
+/// Publishing below the newest version overall stopped being suspicious the day
+/// compatibility moved onto the release, so `--allow-older` is no longer needed
+/// for the ordinary "fix an old line" case. It still covers going behind on
+/// your OWN line, which remains a real mistake.
 fn check_version(
     registry: &Registry,
     manifest: &Manifest,
@@ -640,25 +689,92 @@ fn check_version(
         ));
     }
 
-    let current = releases
-        .iter()
-        .find(|r| r.is_current)
-        .map(|r| r.version.as_str())
-        .unwrap_or(asset.version.as_str());
+    let mine = manifest.min_engine_version.as_deref().unwrap_or("");
 
-    if allow_older || crate::version_gt(&manifest.version, current) {
-        return Ok(());
+    // A marketplace that predates per-release compatibility reports no engine on
+    // any release, so every release is on one line and the old whole-listing
+    // comparison is the only correct one.
+    let per_release = releases.iter().any(|r| !r.min_engine_version.is_empty());
+    if !per_release {
+        let current = releases
+            .iter()
+            .find(|r| r.is_current)
+            .map(|r| r.version.as_str())
+            .unwrap_or(asset.version.as_str());
+        if allow_older || crate::version_gt(&manifest.version, current) {
+            return Ok(());
+        }
+        return Err(format!(
+            "v{} is behind \"{}\"'s current v{current}, and publishing it would make \
+             it the version buyers get.\n\
+             Bump the version in {}, or pass --allow-older if you mean to publish \
+             behind the current release.",
+            manifest.version,
+            asset.name,
+            manifest.source.display()
+        ));
     }
 
-    Err(format!(
-        "v{} is behind \"{}\"'s current v{current}, and publishing it would make \
-         it the version buyers get.\n\
-         Bump the version in {}, or pass --allow-older if you mean to publish \
-         behind the current release.",
-        manifest.version,
-        asset.name,
-        manifest.source.display()
-    ))
+    // Nothing on a newer line may be at or below this version, or that line's
+    // users start resolving this release instead of their own.
+    if let Some(clash) = releases
+        .iter()
+        .filter(|r| engine_newer(&r.min_engine_version, mine))
+        .find(|r| !crate::version_gt(&r.version, &manifest.version))
+    {
+        return Err(format!(
+            "v{} is at or above v{} on the {} line, which is newer than the {} \
+             line you are publishing to.\n\
+             Editors on {} can run both releases and take whichever has the \
+             higher version, so publishing this would hand them the {} code.\n\
+             Use a version below v{} in {}, or publish this to {} instead.",
+            manifest.version,
+            clash.version,
+            clash.min_engine_version,
+            engine_label(mine),
+            clash.min_engine_version,
+            engine_label(mine),
+            clash.version,
+            manifest.source.display(),
+            clash.min_engine_version,
+        ));
+    }
+
+    // Within this line, and the older ones it inherits, the usual rule holds:
+    // an editor here resolves the highest version it can run, so anything not
+    // above that is a release nobody would ever be given.
+    let highest_here = releases
+        .iter()
+        .filter(|r| !engine_newer(&r.min_engine_version, mine))
+        .map(|r| r.version.as_str())
+        .fold(None::<&str>, |best, v| match best {
+            Some(b) if !crate::version_gt(v, b) => Some(b),
+            _ => Some(v),
+        });
+
+    match highest_here {
+        Some(newest) if !allow_older && !crate::version_gt(&manifest.version, newest) => {
+            Err(format!(
+                "v{} is behind v{newest} on the {} line, so editors there would go \
+                 on getting v{newest} and never see this.\n\
+                 Bump the version in {}, or pass --allow-older if you mean to \
+                 publish behind it.",
+                manifest.version,
+                engine_label(mine),
+                manifest.source.display()
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// How to name an engine line in a message, including the one with no floor.
+fn engine_label(tag: &str) -> String {
+    if tag.trim().is_empty() {
+        "any engine".to_string()
+    } else {
+        tag.to_string()
+    }
 }
 
 /// Everything `publish` would do, stopping short of the upload.
@@ -895,6 +1011,13 @@ fn publish_release(
             "version": manifest.version,
             "notes": notes,
             "zip_action": manifest.zip_action,
+            // Stamped on the release, not just the listing. The listing holds
+            // one value and can therefore only ever describe the newest
+            // release, which is what used to cut older-engine users off from
+            // the release that still worked for them. A marketplace that does
+            // not know the field falls back to the listing's, so sending it
+            // costs nothing against an older one.
+            "min_engine_version": manifest.min_engine_version.clone().unwrap_or_default(),
         }))
         .map_err(|e| e.to_string())?,
     );
@@ -1271,6 +1394,33 @@ fn filename(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_tags_order_by_their_number_not_their_text() {
+        assert!(engine_newer("r1-alpha8", "r1-alpha7"));
+        assert!(!engine_newer("r1-alpha7", "r1-alpha8"));
+        assert!(!engine_newer("r1-alpha7", "r1-alpha7"));
+        // The case a string compare gets backwards.
+        assert!(engine_newer("r1-alpha10", "r1-alpha7"));
+        assert!("r1-alpha10" < "r1-alpha7");
+    }
+
+    /// No floor is the oldest line there is: that release is offered to every
+    /// editor, including ones older than any tag names.
+    #[test]
+    fn any_engine_is_the_oldest_line() {
+        assert!(engine_newer("r1-alpha7", ""));
+        assert!(!engine_newer("", "r1-alpha7"));
+        assert!(!engine_newer("", ""));
+    }
+
+    /// A scheme we do not recognise must not block a publish, in either
+    /// direction: "cannot tell" is not "newer".
+    #[test]
+    fn an_unreadable_tag_settles_nothing() {
+        assert!(!engine_newer("whatever", "r1-alpha7"));
+        assert!(!engine_newer("r1-alpha7", "whatever"));
+    }
 
     const CHANGELOG: &str = "\
 # Changelog

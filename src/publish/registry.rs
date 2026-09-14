@@ -75,11 +75,18 @@ struct EngineVersions {
     versions: Vec<EngineVersion>,
 }
 
-/// One engine release, as the docs index lists it.
+/// One engine release.
+///
+/// Deserializes both shapes this can arrive in, because it comes from either of
+/// two endpoints: the marketplace calls the field `version`, the docs index
+/// calls it `id`, and they are the same string.
 #[derive(Debug, Deserialize)]
 pub struct EngineVersion {
+    #[serde(alias = "version")]
     pub id: String,
-    /// `current` for the release this marketplace is on, `archived` otherwise.
+    /// `current` for the release the docs are on, `archived` otherwise. Empty
+    /// from the marketplace, which orders by `ordinal` instead and has no
+    /// opinion about which release is the documented one.
     #[serde(default)]
     pub status: String,
 }
@@ -91,6 +98,17 @@ pub struct Release {
     /// returns, which describes the release it just made.
     #[serde(default)]
     pub is_current: bool,
+    /// The oldest engine this release runs on. Empty means any.
+    ///
+    /// Per release, so one listing can carry an r1-alpha7 line and an r1-alpha8
+    /// line at once and each engine resolves its own. That is what makes
+    /// publishing a fix behind the newest version legitimate, and it is why the
+    /// version check has to know which line a release belongs to.
+    ///
+    /// Empty from a marketplace that predates the field, where every release is
+    /// on one line and the older whole-listing comparison is the right one.
+    #[serde(default)]
+    pub min_engine_version: String,
 }
 
 impl Registry {
@@ -134,7 +152,25 @@ impl Registry {
 
     /// The engine releases a listing may name as its floor — the same list the
     /// website's "Minimum Engine Version" dropdown loads.
+    /// The marketplace's list first, the docs index as a fallback.
+    ///
+    /// They are not interchangeable, and the order matters. Since per-release
+    /// compatibility, a release's engine is a foreign key into the
+    /// marketplace's own table, so that table is the only list that decides
+    /// whether a publish is accepted. The docs index is a different thing that
+    /// usually agrees: it lists which versions have documentation, and a
+    /// version can appear there before the marketplace has it. Validating
+    /// against the docs list alone would pass a tag the upload then rejects.
+    ///
+    /// The fallback stays because a deployment that has not been updated serves
+    /// no marketplace list, and losing the check entirely would be worse than
+    /// checking against a list that is merely usually right.
     pub fn engine_versions(&self) -> Result<Vec<EngineVersion>, String> {
+        if let Ok(versions) = self.get::<Vec<EngineVersion>>("/marketplace/engine-versions") {
+            if !versions.is_empty() {
+                return Ok(versions);
+            }
+        }
         let list: EngineVersions = self.get("/docs/versions")?;
         Ok(list.versions)
     }
