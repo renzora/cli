@@ -113,6 +113,13 @@ what the manifest actually **states**: an absent `price_credits` is not an
 instruction to make an asset free, and a directory name is not an instruction
 to retitle a listing somebody named on the website.
 
+**A release does not move a listing to another category.** If the manifest's
+`category` differs from the listing's, publishing stops and says so, because the
+marketplace checks a release against the category the listing is in and how a
+download installs follows it. A marketplace admin can move the listing in the
+same run with `--move-category`: the listing keeps its page, downloads and
+reviews, moves first, and is moved back if the release upload then fails.
+
 | Flag | |
 |---|---|
 | `--all` | Publish every directory one level down that claims a `marketplace_id` |
@@ -121,6 +128,7 @@ to retitle a listing somebody named on the website.
 | `--thumbnails` | Replace cover images only — no release, no version bump |
 | `--dry-run` | Do everything except the upload (see below) |
 | `--allow-older` | Publish behind the listing's current version |
+| `--move-category` | Move an existing listing into the manifest's category first (admins only) |
 | `--out <path>` | Also write the zip out, to inspect what would ship |
 | `--list-categories` | Print the marketplace's categories |
 | `-y`, `--yes` | Don't ask before publishing |

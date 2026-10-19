@@ -152,6 +152,10 @@ enum Commands {
         /// Publish even though the version is behind the listing's current one.
         #[arg(long)]
         allow_older: bool,
+        /// Move an existing listing into the manifest's category first, keeping
+        /// its page, downloads and reviews (marketplace admins only).
+        #[arg(long)]
+        move_category: bool,
         /// Don't ask before publishing.
         #[arg(long, short = 'y')]
         yes: bool,
@@ -187,6 +191,7 @@ fn main() {
             notes_file,
             out,
             allow_older,
+            move_category,
             yes,
         } => {
             return unwrap_or_fail(publish::publish(publish::PublishArgs {
@@ -201,6 +206,7 @@ fn main() {
                 notes_file,
                 out,
                 allow_older,
+                move_category,
                 yes,
             }))
         }

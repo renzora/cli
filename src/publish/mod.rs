@@ -117,6 +117,8 @@ pub struct PublishArgs {
     pub notes: Option<String>,
     pub notes_file: Option<String>,
     pub out: Option<String>,
+    /// Move an existing listing into the manifest's category before releasing.
+    pub move_category: bool,
     pub yes: bool,
 }
 
@@ -337,6 +339,7 @@ fn publish_one(dir: PathBuf, args: &PublishArgs) -> Result<(), String> {
             args.notes.as_deref(),
             args.notes_file.as_deref(),
             args.allow_older,
+            args.move_category,
         );
     }
 
@@ -369,11 +372,44 @@ fn ship(
         }
         Some(asset) => {
             check_version(registry, manifest, &asset, args.allow_older)?;
+            let moving = category_move(manifest, &asset, args.move_category)?;
             let notes =
                 release_notes(manifest, args.notes.as_deref(), args.notes_file.as_deref())?;
-            publish_release(registry, manifest, package, &asset, &notes, yes)
+            publish_release(registry, manifest, package, &asset, &notes, moving, yes)
         }
     }
+}
+
+/// A listing moving category on this release: from, to.
+type CategoryMove = Option<(String, String)>;
+
+/// Whether releasing onto `asset` needs it moved to the manifest's category.
+///
+/// A mismatch is refused unless `--move-category` asks for the move. It used to
+/// be a warning and the release went ahead, which never worked when it
+/// mattered: the server checks the upload against the listing's *current*
+/// category, so a shader package released onto a plugin listing failed as "not
+/// a plugin" after the archive had already gone up.
+fn category_move(
+    manifest: &Manifest,
+    asset: &registry::Asset,
+    move_category: bool,
+) -> Result<CategoryMove, String> {
+    if asset.category == manifest.category {
+        return Ok(None);
+    }
+    if move_category {
+        return Ok(Some((asset.category.clone(), manifest.category.clone())));
+    }
+    Err(format!(
+        "\"{}\" is in `{}` but {} says `{}`. A release does not move a listing; \
+         pass --move-category to move it first (marketplace admins only), or put \
+         the category back.",
+        asset.name,
+        asset.category,
+        manifest.source.display(),
+        manifest.category
+    ))
 }
 
 // ── Batch ──────────────────────────────────────────────────────────────────
@@ -574,8 +610,12 @@ fn batch_verdict(
         )),
         Some(asset) => {
             check_version(registry, manifest, &asset, args.allow_older)?;
+            let moving = match category_move(manifest, &asset, args.move_category)? {
+                Some((from, to)) => format!(", moving it from {from} to {to}"),
+                None => String::new(),
+            };
             Ok(format!(
-                "release v{} onto \"{}\" (at v{})",
+                "release v{} onto \"{}\" (at v{}){moving}",
                 manifest.version, asset.name, asset.version
             ))
         }
@@ -795,6 +835,7 @@ fn dry_run(
     notes: Option<&str>,
     notes_file: Option<&str>,
     allow_older: bool,
+    move_category: bool,
 ) -> Result<(), String> {
     let Ok(creds) = credentials::load() else {
         return finish_dry_run(Some(
@@ -828,11 +869,13 @@ fn dry_run(
         mine: registry.my_assets()?,
     };
     let existing = catalog.find_listing(&registry, manifest)?;
+    let mut moving = None;
     if let Some(asset) = &existing {
         check_version(&registry, manifest, asset, allow_older)?;
+        moving = category_move(manifest, asset, move_category)?;
     }
 
-    for line in plan(manifest, existing.as_ref()) {
+    for line in plan(manifest, existing.as_ref(), moving.as_ref()) {
         println!("{:>VERB$} {line}", "Would");
     }
     if let Some(asset) = &existing {
@@ -854,7 +897,11 @@ fn finish_dry_run(skipped: Option<&str>) -> Result<(), String> {
 }
 
 /// What publishing would do, in the order it would do it.
-fn plan(manifest: &Manifest, existing: Option<&registry::Asset>) -> Vec<String> {
+fn plan(
+    manifest: &Manifest,
+    existing: Option<&registry::Asset>,
+    moving: Option<&(String, String)>,
+) -> Vec<String> {
     let mut lines = Vec::new();
     match existing {
         None => {
@@ -872,6 +919,12 @@ fn plan(manifest: &Manifest, existing: Option<&registry::Asset>) -> Vec<String> 
             lines.extend(describe_engine_floor(manifest));
         }
         Some(asset) => {
+            if let Some((from, to)) = moving {
+                lines.push(format!(
+                    "move \"{}\" from {from} to {to}, keeping its page, downloads and reviews",
+                    asset.name
+                ));
+            }
             lines.push(format!(
                 "publish v{} to \"{}\", which is at v{}",
                 manifest.version, asset.name, asset.version
@@ -984,26 +1037,30 @@ fn publish_release(
     package: &package::Package,
     asset: &registry::Asset,
     notes: &str,
+    moving: CategoryMove,
     yes: bool,
 ) -> Result<(), String> {
-    if asset.category != manifest.category {
-        println!(
-            "{:>VERB$} the listing is in `{}` but the manifest says `{}`; a \
-             release cannot move it, so it stays in `{}`.",
-            "Warning", asset.category, manifest.category, asset.category
-        );
-    }
-
-    if !confirm(
-        yes,
-        &format!(
+    let question = match &moving {
+        Some((from, to)) => format!(
+            "Move {} from {from} to {to} and publish v{} (the listing is at v{})?",
+            asset.name, manifest.version, asset.version
+        ),
+        None => format!(
             "Publish {} v{} (the listing is at v{})?",
             asset.name, manifest.version, asset.version
         ),
-    )? {
+    };
+    if !confirm(yes, &question)? {
         return Err("cancelled".into());
     }
 
+    // Moved before the upload, because the server checks a release against the
+    // listing's category as it stands: a shader package onto a listing still
+    // in `plugins` is refused as not being a plugin.
+    if let Some((from, to)) = &moving {
+        registry.set_category(&asset.id, to)?;
+        status("Moved", format!("{} from {from} to {to}", asset.name));
+    }
     let mut body = Multipart::new();
     body.text(
         "metadata",
@@ -1027,7 +1084,26 @@ fn publish_release(
         "Uploading",
         format!("{} v{} to an existing listing", manifest.name, manifest.version),
     );
-    let release = registry.create_release(&asset.id, body)?;
+    let release = match registry.create_release(&asset.id, body) {
+        Ok(release) => release,
+        Err(e) => {
+            // A listing left moved with no release of the new kind would
+            // install its old files the new way, so a failed upload puts the
+            // category back.
+            if let Some((from, _)) = &moving {
+                match registry.set_category(&asset.id, from) {
+                    Ok(()) => status("Moved", format!("{} back to {from}", asset.name)),
+                    Err(back) => {
+                        return Err(format!(
+                            "{e}\nThe listing was moved before the upload and could not be \
+                             moved back ({back}): move it back to `{from}` in the admin panel."
+                        ))
+                    }
+                }
+            }
+            return Err(e);
+        }
+    };
 
     // The manifest is the source of truth for everything but the files, so a
     // description or price edited there lands with the release rather than
@@ -1480,7 +1556,7 @@ mod tests {
     #[test]
     fn a_dry_run_says_it_would_create_an_unknown_listing() {
         let manifest = manifest_for("create", "");
-        let lines = plan(&manifest, None);
+        let lines = plan(&manifest, None, None);
         assert!(lines[0].contains("create a new listing"), "{lines:?}");
         assert!(lines[0].contains("v1.1.0"), "{lines:?}");
     }
@@ -1488,13 +1564,33 @@ mod tests {
     #[test]
     fn a_dry_run_names_the_version_a_release_would_leave_alone() {
         let manifest = manifest_for("release", "");
-        let lines = plan(&manifest, Some(&listing("1.0.0")));
+        let lines = plan(&manifest, Some(&listing("1.0.0")), None);
 
         assert!(lines[0].contains("publish v1.1.0"), "{lines:?}");
         assert!(
             lines.iter().any(|l| l.contains("leave v1.0.0 downloadable")),
             "the whole point of releases is that the old one survives: {lines:?}"
         );
+    }
+
+    #[test]
+    fn a_category_mismatch_is_refused_unless_the_move_is_asked_for() {
+        let manifest = manifest_for("move", "");
+        let mut plugin = listing("1.0.0");
+        plugin.category = "plugins".into();
+
+        let refused = category_move(&manifest, &plugin, false).unwrap_err();
+        assert!(refused.contains("--move-category"), "{refused}");
+        assert_eq!(
+            category_move(&manifest, &plugin, true).unwrap(),
+            Some(("plugins".to_string(), "3d-models".to_string()))
+        );
+        // Same category: nothing to move, flag or not.
+        assert_eq!(category_move(&manifest, &listing("1.0.0"), true).unwrap(), None);
+
+        let moving = ("plugins".to_string(), "3d-models".to_string());
+        let lines = plan(&manifest, Some(&plugin), Some(&moving));
+        assert!(lines[0].starts_with("move \"Forest\" from plugins to 3d-models"), "{lines:?}");
     }
 
     #[test]
@@ -1530,7 +1626,7 @@ mod tests {
             "a thumbnail, 2 screenshots"
         );
         assert!(
-            !plan(&manifest, Some(&listing("1.0.0")))
+            !plan(&manifest, Some(&listing("1.0.0")), None)
                 .iter()
                 .any(|l| l.contains("thumbnail")),
             "a release uploads files only, so it must not promise to upload media"

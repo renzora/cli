@@ -250,6 +250,34 @@ impl Registry {
         Ok(())
     }
 
+    /// Move a listing to another category: `PUT /admin/assets/:id/category`.
+    ///
+    /// Admin only. Nothing a creator can call changes a category, because it
+    /// changes how every download of the listing installs.
+    pub fn set_category(&self, asset_id: &str, category: &str) -> Result<(), String> {
+        let url = format!("{}/admin/assets/{asset_id}/category", self.api);
+        let response = self
+            .agent
+            .put(&url)
+            .header("Authorization", &format!("Bearer {}", self.token))
+            .header("Content-Type", "application/json")
+            .send(
+                serde_json::to_vec(&serde_json::json!({ "category": category }))
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| transport_error(&url, e))?;
+        // The admin routes answer a non-admin with 401 or 403, which the
+        // general explanation reads as a bad token; the token is fine.
+        if matches!(response.status().as_u16(), 401 | 403) {
+            return Err("only a marketplace admin can move a listing to another category. \
+                        Ask one to move it, or publish to a new listing with its own \
+                        `marketplace_id`."
+                .into());
+        }
+        self.decode::<serde_json::Value>(url, response)?;
+        Ok(())
+    }
+
     fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, String> {
         let url = format!("{}{path}", self.api);
         let response = self
